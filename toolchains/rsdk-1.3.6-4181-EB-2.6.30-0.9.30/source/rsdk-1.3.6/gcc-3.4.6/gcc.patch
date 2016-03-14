@@ -1,0 +1,213 @@
+diff --git a/gcc/common.opt b/gcc/common.opt
+index 2ea659e..8b58495 100644
+--- a/gcc/common.opt
++++ b/gcc/common.opt
+@@ -760,6 +760,10 @@ funwind-tables
+ Common
+ Just generate unwind tables for exception handling
+ 
++fuse-uls
++Common
++Allow compiler to emit unaligned load/store instructions
++
+ fverbose-asm
+ Common
+ Add extra commentary to assembler output
+diff --git a/gcc/config.gcc b/gcc/config.gcc
+index 1a1326b..f4cc4c0 100644
+--- a/gcc/config.gcc
++++ b/gcc/config.gcc
+@@ -1564,13 +1564,13 @@ mips64*-*-linux*)
+ 	gas=yes
+ 	;;
+ mips*-*-linux*)				# Linux MIPS, either endian.
+-  tm_file="dbxelf.h elfos.h svr4.h linux.h ${tm_file} mips/linux.h"
++        tm_file="dbxelf.h elfos.h svr4.h linux.h ${tm_file} mips/linux.h"
+ 	case ${target} in
+-    mipsisa32*-*)
+-      target_cpu_default="MASK_SOFT_FLOAT"
+-      tm_defines="MIPS_ISA_DEFAULT=32"
+-      ;;
+-  esac
++        mipsisa32*-*)
++            target_cpu_default="MASK_SOFT_FLOAT"
++            tm_defines="MIPS_ISA_DEFAULT=32"
++            ;;
++        esac
+ 	tmake_file="t-slibgcc-elf-ver t-linux mips/t-linux"
+ 	;;
+ mips*-*-openbsd*)
+diff --git a/gcc/config/mips/mips.c b/gcc/config/mips/mips.c
+index df8f166..81470ae 100644
+--- a/gcc/config/mips/mips.c
++++ b/gcc/config/mips/mips.c
+@@ -728,8 +728,10 @@ const struct mips_cpu_info mips_cpu_info_table[] = {
+ 
+   {"4180", PROCESSOR_LX4180, 1},
+   {"4181", PROCESSOR_RLX4181, 1},
++  {"4281", PROCESSOR_RLX4281, 1},
+   {"5181", PROCESSOR_RLX5181, 1},
+   {"5280", PROCESSOR_LX5280, 1},
++  {"5281", PROCESSOR_RLX5281, 1},
+ 
+   /* MIPS II */
+   {"r6000", PROCESSOR_R6000, 2},
+@@ -3514,8 +3516,9 @@ mips_block_move_straight (rtx dest, rtx src, HOST_WIDE_INT length)
+       if (MEM_ALIGN (src) >= bits)
+ 	emit_move_insn (regs[i], adjust_address (src, mode, offset));
+ 
+-      else if (TARGET_LX5280 || TARGET_RLX5181 || TARGET_LX4180
+-	       || TARGET_RLX4181)
++      else if ((TARGET_RLX5281 || TARGET_LX5280 || TARGET_RLX5181
++          || TARGET_RLX4281 || TARGET_LX4180 || TARGET_RLX4181)
++          && !flag_use_uls)
+ 	{
+ 	  rtx result_part = extract_bit_field (src, bits,
+ 					       offset * BITS_PER_UNIT, 1,
+@@ -3535,8 +3538,9 @@ mips_block_move_straight (rtx dest, rtx src, HOST_WIDE_INT length)
+   for (offset = 0, i = 0; offset + delta <= length; offset += delta, i++)
+     if (MEM_ALIGN (dest) >= bits)
+       emit_move_insn (adjust_address (dest, mode, offset), regs[i]);
+-    else if (TARGET_LX5280 || TARGET_RLX5181 || TARGET_LX4180
+-	     || TARGET_RLX4181)
++    else if ((TARGET_RLX5281 || TARGET_LX5280 || TARGET_RLX5181
++          || TARGET_RLX4281 || TARGET_LX4180 || TARGET_RLX4181)
++          && !flag_use_uls)
+       store_bit_field (dest, bits, offset * BITS_PER_UNIT, mode, regs[i],
+ 		       delta);
+     else
+diff --git a/gcc/config/mips/mips.h b/gcc/config/mips/mips.h
+index 139d836..c42d0f5 100644
+--- a/gcc/config/mips/mips.h
++++ b/gcc/config/mips/mips.h
+@@ -62,8 +62,10 @@ enum processor_type {
+   PROCESSOR_R4650,
+   PROCESSOR_LX4180,
+   PROCESSOR_RLX4181,
++  PROCESSOR_RLX4281,
+   PROCESSOR_RLX5181,
+   PROCESSOR_LX5280,
++  PROCESSOR_RLX5281,
+   PROCESSOR_R5000,
+   PROCESSOR_R5400,
+   PROCESSOR_R5500,
+@@ -359,8 +361,10 @@ extern const struct mips_cpu_info *mips_tune_info;
+ #define TARGET_SR71K                (mips_arch == PROCESSOR_SR71000)
+ #define TARGET_LX4180              (mips_arch == PROCESSOR_LX4180)
+ #define TARGET_RLX4181              (mips_arch == PROCESSOR_RLX4181)
++#define TARGET_RLX4281              (mips_arch == PROCESSOR_RLX4281)
+ #define TARGET_RLX5181              (mips_arch == PROCESSOR_RLX5181)
+ #define TARGET_LX5280              (mips_arch == PROCESSOR_LX5280)
++#define TARGET_RLX5281              (mips_arch == PROCESSOR_RLX5281)
+ 
+ 
+ /* Scheduling target defines.  */
+@@ -1207,8 +1211,10 @@ extern const struct mips_cpu_info *mips_tune_info;
+ %{!mips16:%{!march*:%{!mcpu*:%{!mtune*:-march=4180}}}}}}}}}}} \
+ %{m4180:-march=4180} \
+ %{m4181:-march=4181} \
++%{m4281:-march=4281} \
+ %{m5181:-march=5181} \
+ %{m5280:-march=5280} \
++%{m5281:-march=5281} \
+ %{G*} %{EB:-meb} %{EL:-mel} %{EB:%{EL:%emay not use both -EB and -EL}} \
+ %{save-temps: } \
+ %(subtarget_cc1_spec)"
+diff --git a/gcc/config/mips/mips.md b/gcc/config/mips/mips.md
+index b30e4b5..c8be6f6 100644
+--- a/gcc/config/mips/mips.md
++++ b/gcc/config/mips/mips.md
+@@ -214,7 +214,7 @@
+ ;; Attribute describing the processor.  This attribute must match exactly
+ ;; with the processor_type enumeration in mips.h.
+ (define_attr "cpu"
+-  "default,4kc,5kc,20kc,m4k,r3000,r3900,r6000,r4000,r4100,r4111,r4120,r4300,r4600,r4650,lx4180,rlx4181,rlx5181,lx5280,r5000,r5400,r5500,r7000,r8000,r9000,sb1,sr71000"
++  "default,4kc,5kc,20kc,m4k,r3000,r3900,r6000,r4000,r4100,r4111,r4120,r4300,r4600,r4650,lx4180,rlx4181,rlx4281,rlx5181,lx5280,rlx5281,r5000,r5400,r5500,r7000,r8000,r9000,sb1,sr71000"
+   (const (symbol_ref "mips_tune")))
+ 
+ ;; The type of hardware hazard associated with this instruction.
+@@ -4015,7 +4015,8 @@ dsrl\t%3,%3,1\n\
+ 		      (match_operand 3 "immediate_operand" "")))]
+   "!TARGET_MIPS16"
+ {
+-  if (TARGET_LX5280 || TARGET_RLX4181 || TARGET_LX4180 || TARGET_RLX5181)
++  if ((TARGET_RLX5281 || TARGET_LX5280 || TARGET_RLX4281 || TARGET_RLX4181 || TARGET_LX4180 || TARGET_RLX5181)
++      && !flag_use_uls)
+   {
+     FAIL;
+   }
+@@ -4035,7 +4036,8 @@ dsrl\t%3,%3,1\n\
+ 		      (match_operand 3 "immediate_operand" "")))]
+   "!TARGET_MIPS16"
+ {
+-  if (TARGET_LX5280 || TARGET_RLX4181 || TARGET_LX4180 || TARGET_RLX5181)
++  if ((TARGET_RLX5281 || TARGET_LX5280 || TARGET_RLX4281 || TARGET_RLX4181 || TARGET_LX4180 || TARGET_RLX5181)
++      && !flag_use_uls)
+   {
+     FAIL;
+   }
+@@ -4055,7 +4057,8 @@ dsrl\t%3,%3,1\n\
+ 	(match_operand 3 "reg_or_0_operand" ""))]
+   "!TARGET_MIPS16"
+ {
+-  if (TARGET_LX5280 || TARGET_RLX4181 || TARGET_LX4180 || TARGET_RLX5181)
++  if ((TARGET_RLX5281 || TARGET_LX5280 || TARGET_RLX4281 || TARGET_RLX4181 || TARGET_LX4180 || TARGET_RLX5181)
++      && !flag_use_uls)
+   {
+     FAIL;
+   }
+diff --git a/gcc/cp/Make-lang.in b/gcc/cp/Make-lang.in
+index 5888110..27e1752 100644
+--- a/gcc/cp/Make-lang.in
++++ b/gcc/cp/Make-lang.in
+@@ -161,7 +161,7 @@ c++.install-common: installdirs
+ # We can't use links because not everyone supports them, and we can't use
+ # .so because Irix 6.5 doesn't support them.  So just copy the manpage.
+ doc/g++.1: doc/gcc.1
+-	cp doc/gcc.1 doc/g++.1
++	cp $(srcdir)/doc/gcc.1 doc/g++.1
+ 
+ c++.install-man: installdirs $(DESTDIR)$(man1dir)/$(GXX_INSTALL_NAME)$(man1ext) 
+ 
+diff --git a/gcc/flags.h b/gcc/flags.h
+index e947f2a..280980c 100644
+--- a/gcc/flags.h
++++ b/gcc/flags.h
+@@ -742,6 +742,9 @@ extern int flag_abi_version;
+ /* Returns TRUE if generated code should match ABI version N or
+    greater is in use.  */
+ 
++extern int flag_use_uls;
++
++
+ #define abi_version_at_least(N) \
+   (flag_abi_version == 0 || flag_abi_version >= (N))
+ 
+diff --git a/gcc/opts.c b/gcc/opts.c
+index 0f4b35c..c9f38d4 100644
+--- a/gcc/opts.c
++++ b/gcc/opts.c
+@@ -1134,6 +1134,10 @@ common_handle_option (size_t scode, const char *arg,
+     case OPT_pros:
+       break;
+ 
++    case OPT_fuse_uls:
++      flag_use_uls = value;
++      break;
++
+     case OPT_fnon_call_exceptions:
+       flag_non_call_exceptions = value;
+       break;
+diff --git a/gcc/toplev.c b/gcc/toplev.c
+index d97d219..665e176 100644
+--- a/gcc/toplev.c
++++ b/gcc/toplev.c
+@@ -959,6 +959,8 @@ int flag_tracer = 0;
+ 
+ int flag_unit_at_a_time = 0;
+ 
++int flag_use_uls = 0;
++
+ /* Values of the -falign-* flags: how much to align labels in code.
+    0 means `use default', 1 means `don't align'.
+    For each variable, there is an _log variant which is the power

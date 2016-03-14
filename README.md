@@ -1,0 +1,1 @@
+JWNR2000-4EMRUS Firmware v04.00.05
